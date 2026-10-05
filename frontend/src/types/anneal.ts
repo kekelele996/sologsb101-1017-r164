@@ -27,6 +27,12 @@ export interface Anneal {
   inAt: string
   /** 出炉时间 ISO 字符串；未出炉为空串 */
   outAt: string
+  /**
+   * 补记的该段实际时长（小时，保留 1 位小数）；
+   * null 表示未补记，该段时长回落到按壁厚计算的理论值。
+   * 撤回补记即写回 null。
+   */
+  actualHours: number | null
   /** 退火状态 */
   state: AnnealState
   createdAt: string

@@ -11,7 +11,14 @@ import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
-import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
+import {
+  effectivePieceDuration,
+  effectiveSegmentHours,
+  formatHours,
+  isLowRemain,
+  segmentHours,
+  totalAnnealHours,
+} from './thermal'
 
 /** 触发浏览器下载 */
 export function download(filename: string, content: string, mime: string): void {
@@ -101,6 +108,8 @@ export function buildScheduleCsv(
     '退火窑位',
     '退火状态',
     '理论退火时长',
+    '补记后退火时长',
+    '已补记段数',
     '检验次数',
     '最近检验结果',
   ]
@@ -113,6 +122,7 @@ export function buildScheduleCsv(
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
+    const actualDuration = effectivePieceDuration(pieceAnneals, piece.wallThicknessMm)
     lines.push(
       [
         piece.name,
@@ -130,6 +140,8 @@ export function buildScheduleCsv(
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
+        actualDuration.hasActual ? formatHours(actualDuration.totalHours) : '—',
+        actualDuration.actualCount,
         pieceInspects.length,
         latestInspect?.result ?? '—',
       ]
@@ -198,9 +210,25 @@ export function buildStepCardText(
       )
     })
   if (anneals.length > 0) {
+    const actualDuration = effectivePieceDuration(anneals, piece.wallThicknessMm)
+    if (actualDuration.hasActual) {
+      lines.push(
+        `补记后退火时长：${formatHours(actualDuration.totalHours)}（升温 ${formatHours(
+          actualDuration.segHours.升温,
+        )} / 保温 ${formatHours(actualDuration.segHours.保温)} / 缓冷 ${formatHours(
+          actualDuration.segHours.缓冷,
+        )}，已补记 ${actualDuration.actualCount} 段；未补记段仍按壁厚理论值）`,
+      )
+    }
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      const actualTag =
+        typeof row.actualHours === 'number' && Number.isFinite(row.actualHours) && row.actualHours > 0
+          ? ` · 实际 ${formatHours(
+              effectiveSegmentHours(row.curveSeg, piece.wallThicknessMm, row.actualHours),
+            )}（理论 ${formatHours(segmentHours(row.curveSeg, piece.wallThicknessMm))}）`
+          : ` · 理论 ${formatHours(segmentHours(row.curveSeg, piece.wallThicknessMm))}`
+      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}${actualTag}`)
     })
   }
   return lines.join('\n')

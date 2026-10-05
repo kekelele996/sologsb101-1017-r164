@@ -18,10 +18,14 @@ import {
 } from '../utils/db'
 import {
   checkSlotConflict,
+  effectivePieceDuration,
+  effectiveSegmentHours,
+  findSlotClashes,
   formatHours,
   kilnSlots,
+  round1,
   segmentHours,
-  totalAnnealHours,
+  type SlotClash,
   type SlotConflict,
 } from '../utils/thermal'
 import { nowIso, nowLocalInput, uuid } from '../utils/id'
@@ -43,9 +47,31 @@ export interface SlotOccupancy {
   curveSeg: CurveSeg
   inAt: string
   outAt: string
+  /** 该段生效时长（小时）：已补记按补记，否则按壁厚理论值 */
+  segHours: number
+  /** 是否已补记实际时长 */
+  actual: boolean
+  /** 该段理论时长（小时，壁厚口径） */
+  theoryHours: number
   state: AnnealState
   /** 该窑位当前是否被未出炉记录占用 */
   occupied: boolean
+  /** 与本行撞车的其它退火记录 id */
+  clashIds: string[]
+}
+
+/** 展示用撞车对（已解析作品名与时间窗） */
+export interface SlotClashView extends SlotClash {
+  aName: string
+  bName: string
+}
+
+/** 补记结果：保存后立即对同窑位后续记录重判的撞车情况 */
+export interface ActualHoursResult {
+  ok: boolean
+  /** 保存后涉及该窑位的撞车（至少一端是被补记记录） */
+  clashes: SlotClashView[]
+  message: string
 }
 
 const EMPTY_FILTERS: AnnealFilters = { keyword: '', state: 'all', curveSeg: 'all', kilnCode: 'all' }
@@ -80,11 +106,36 @@ export const useAnnealStore = defineStore('anneal', () => {
     return codes.flatMap((code) => kilnSlots(code))
   })
 
+  /** 当前全部窑位撞车对（补记 / 撤回后立即重判） */
+  const clashes = computed<SlotClashView[]>(() =>
+    findSlotClashes(anneals.value, wallThicknessOf).map((clash) => ({
+      ...clash,
+      aName: pieces.value.find((row) => row.id === clash.aPieceId)?.name ?? '（作品已删除）',
+      bName: pieces.value.find((row) => row.id === clash.bPieceId)?.name ?? '（作品已删除）',
+    })),
+  )
+
+  /** annealId → 与其撞车的记录 id 集合 */
+  const clashIdsByAnneal = computed<Map<string, Set<string>>>(() => {
+    const map = new Map<string, Set<string>>()
+    clashes.value.forEach((clash) => {
+      const add = (a: string, b: string): void => {
+        const set = map.get(a) ?? new Set<string>()
+        set.add(b)
+        map.set(a, set)
+      }
+      add(clash.aId, clash.bId)
+      add(clash.bId, clash.aId)
+    })
+    return map
+  })
+
   /** 窑位占用表 */
   const occupancy = computed<SlotOccupancy[]>(() =>
     anneals.value
       .map((row) => {
         const piece = pieces.value.find((item) => item.id === row.pieceId)
+        const thickness = piece?.wallThicknessMm ?? wallThicknessOf(row.pieceId)
         return {
           kilnSlot: row.kilnSlot,
           annealId: row.id,
@@ -93,8 +144,12 @@ export const useAnnealStore = defineStore('anneal', () => {
           curveSeg: row.curveSeg,
           inAt: row.inAt,
           outAt: row.outAt,
+          segHours: effectiveSegmentHours(row.curveSeg, thickness, row.actualHours),
+          actual: typeof row.actualHours === 'number' && Number.isFinite(row.actualHours) && row.actualHours > 0,
+          theoryHours: segmentHours(row.curveSeg, thickness),
           state: row.state,
           occupied: row.state !== '已出炉',
+          clashIds: Array.from(clashIdsByAnneal.value.get(row.id) ?? []),
         }
       })
       .sort((a, b) => a.kilnSlot.localeCompare(b.kilnSlot) || a.inAt.localeCompare(b.inAt))
@@ -122,18 +177,63 @@ export const useAnnealStore = defineStore('anneal', () => {
     })
   })
 
-  /** 某件作品的窑位冲突检测（编辑时排除自身） */
+  /** 某条记录的窑位冲突检测（编辑时排除自身）；候选未带 actualHours 时按未补记处理 */
   function conflictOf(
-    candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+    candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'> & {
+      actualHours?: number | null
+    },
   ): SlotConflict {
-    return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id)
+    const result = checkSlotConflict(
+      anneals.value,
+      { actualHours: null, ...candidate },
+      wallThicknessOf,
+      candidate.id,
+    )
+    if (!result.conflict) return result
+    // 拼出带作品名的可读说明
+    const names = result.hits.map((hit) => {
+      const row = anneals.value.find((item) => item.id === hit.withAnnealId)
+      const name = pieces.value.find((item) => item.id === hit.withPieceId)?.name ?? '（作品已删除）'
+      return `${name}（${row?.inAt.replace('T', ' ') ?? ''} 起）`
+    })
+    return {
+      ...result,
+      message: `窑位 ${candidate.kilnSlot} 在该时间窗内与已排的 ${names.join('、')} 撞车，请更换窑位或调整时间。`,
+    }
   }
 
-  /** 某件作品的退火时长汇总 */
-  function durationOf(pieceId: string): { hours: number; text: string } {
+  /** 一件作品的退火时长汇总（按补记口径：补记的段按实际值，其余按壁厚理论值） */
+  function durationOf(pieceId: string): {
+    hours: number
+    text: string
+    theoryHours: number
+    hasActual: boolean
+    actualCount: number
+  } {
     const thickness = wallThicknessOf(pieceId)
-    const hours = totalAnnealHours(thickness)
-    return { hours, text: formatHours(hours) }
+    const rows = anneals.value.filter((row) => row.pieceId === pieceId)
+    const { totalHours, hasActual, actualCount } = effectivePieceDuration(rows, thickness)
+    const theoryHours = effectivePieceDuration([], thickness).totalHours
+    return { hours: totalHours, text: formatHours(totalHours), theoryHours, hasActual, actualCount }
+  }
+
+  /** 一条记录的该段时长（按补记口径）与理论时长 */
+  function segmentDurationOf(row: Pick<Anneal, 'curveSeg' | 'actualHours' | 'pieceId'>): {
+    hours: number
+    theoryHours: number
+    actual: boolean
+    text: string
+  } {
+    const thickness = wallThicknessOf(row.pieceId)
+    const hours = effectiveSegmentHours(row.curveSeg, thickness, row.actualHours)
+    const theoryHours = segmentHours(row.curveSeg, thickness)
+    const actual = typeof row.actualHours === 'number' && Number.isFinite(row.actualHours) && row.actualHours > 0
+    return { hours, theoryHours, actual, text: formatHours(hours) }
+  }
+
+  /** 取某条记录当前撞车的对方记录（占用表/列表高亮用） */
+  function clashesOf(annealId: string): SlotClashView[] {
+    return clashes.value.filter((clash) => clash.aId === annealId || clash.bId === annealId)
   }
 
   async function loadAll(): Promise<void> {
@@ -182,6 +282,7 @@ export const useAnnealStore = defineStore('anneal', () => {
       outAt: draft.outAt,
       curveSeg: draft.curveSeg,
       pieceId: draft.pieceId,
+      actualHours: null,
     })
     if (conflict.conflict) {
       lastMessage.value = conflict.message
@@ -195,6 +296,7 @@ export const useAnnealStore = defineStore('anneal', () => {
       curveSeg: draft.curveSeg,
       inAt: draft.inAt,
       outAt: draft.outAt,
+      actualHours: null,
       state: draft.state,
       createdAt: stamp,
       updatedAt: stamp,
@@ -207,6 +309,9 @@ export const useAnnealStore = defineStore('anneal', () => {
   }
 
   async function updateAnneal(annealId: string, draft: AnnealDraft): Promise<boolean> {
+    const existing = anneals.value.find((row) => row.id === annealId)
+    if (existing === undefined) return false
+    // 排产编辑沿用既有补记口径参与判重（排产表单不改补记）
     const conflict = conflictOf({
       id: annealId,
       kilnSlot: draft.kilnSlot,
@@ -214,13 +319,12 @@ export const useAnnealStore = defineStore('anneal', () => {
       outAt: draft.outAt,
       curveSeg: draft.curveSeg,
       pieceId: draft.pieceId,
+      actualHours: existing.actualHours,
     })
     if (conflict.conflict) {
       lastMessage.value = conflict.message
       return false
     }
-    const existing = anneals.value.find((row) => row.id === annealId)
-    if (existing === undefined) return false
     await putAnneal({
       ...existing,
       pieceId: draft.pieceId,
@@ -233,6 +337,49 @@ export const useAnnealStore = defineStore('anneal', () => {
     revision.value += 1
     lastMessage.value = '退火编排已更新'
     return true
+  }
+
+  /**
+   * 补记 / 改记 / 撤回某段实际时长（小时）。
+   * hours 为正数 → 补记或改记；传 null → 撤回，口径回到壁厚理论值。
+   * 保存后立刻对同窑位已排记录（含后面已排的）重判一次撞车，
+   * 不阻断保存：撞车结果通过占用表与返回值暴露给排产员。
+   */
+  async function saveActualHours(annealId: string, hours: number | null): Promise<ActualHoursResult | null> {
+    const existing = anneals.value.find((row) => row.id === annealId)
+    if (existing === undefined) return null
+    const nextHours = hours === null ? null : round1(hours)
+    await putAnneal({ ...existing, actualHours: nextHours })
+    revision.value += 1
+
+    // liveQuery 回放是异步的，这里先用「已写入」的本地副本立即重判
+    const simulated = anneals.value.map((row) => (row.id === annealId ? { ...row, actualHours: nextHours } : row))
+    const allClashes = findSlotClashes(simulated, wallThicknessOf)
+      .filter((clash) => clash.aId === annealId || clash.bId === annealId)
+      .map((clash) => ({
+        ...clash,
+        aName: pieces.value.find((row) => row.id === clash.aPieceId)?.name ?? '（作品已删除）',
+        bName: pieces.value.find((row) => row.id === clash.bPieceId)?.name ?? '（作品已删除）',
+      }))
+
+    const segText = formatHours(effectiveSegmentHours(existing.curveSeg, wallThicknessOf(existing.pieceId), nextHours))
+    const who = (clash: SlotClashView): string => (clash.aId === annealId ? clash.bName : clash.aName)
+    let message: string
+    if (nextHours === null) {
+      message =
+        allClashes.length === 0
+          ? `已撤回「${existing.curveSeg}」段补记，该段恢复理论时长 ${segText}`
+          : `已撤回补记并恢复理论口径，但窑位 ${existing.kilnSlot} 仍与 ${allClashes.map(who).join('、')} 撞车`
+    } else {
+      message =
+        allClashes.length === 0
+          ? `已按补记保存「${existing.curveSeg}」段实际时长 ${segText}`
+          : `已按补记保存「${existing.curveSeg}」段实际时长 ${segText}，窑位 ${existing.kilnSlot} 与后面已排的 ${allClashes
+              .map(who)
+              .join('、')} 撞车，请尽快调窑位或时间`
+    }
+    lastMessage.value = message
+    return { ok: true, clashes: allClashes, message }
   }
 
   async function deleteAnneal(annealId: string): Promise<void> {
@@ -267,12 +414,16 @@ export const useAnnealStore = defineStore('anneal', () => {
     kilnCodes,
     allSlots,
     occupancy,
+    clashes,
     occupiedSlotCount,
     occupancyRate,
     visibleAnneals,
     wallThicknessOf,
     conflictOf,
     durationOf,
+    segmentDurationOf,
+    clashesOf,
+    saveActualHours,
     loadAll,
     setFilters,
     resetFilters,
