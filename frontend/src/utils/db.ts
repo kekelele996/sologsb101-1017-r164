@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbglassblow
- * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值
+ * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值，
+ *   v2 → v3 为 Anneal 增加 actualHours（补记的曲线段实际时长）
  * - 提供各表增删改查、作品状态联动、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -19,10 +20,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +47,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -91,6 +92,22 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：Anneal 增加 actualHours（补记的曲线段实际时长），历史记录按未补记处理 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.actualHours !== 'number') row.actualHours = null
         })
       })
   }
@@ -271,6 +288,11 @@ export async function advanceAnnealState(annealId: string, next: Anneal['state']
   await syncPieceState(row.pieceId)
 }
 
+/** 补记 / 撤销某条退火记录的曲线段实际时长（小时）；传 null 表示撤销补记、回到理论口径 */
+export async function setAnnealActualHours(annealId: string, hours: number | null): Promise<void> {
+  await db.anneals.update(annealId, { actualHours: hours, updatedAt: nowIso() })
+}
+
 /* ------------------------------ 出炉检验 ------------------------------ */
 
 export async function listInspects(): Promise<Inspect[]> {
@@ -335,7 +357,14 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
+    // 兼容 v2 及更早的存档：缺失 actualHours 的退火记录按未补记处理
+    await db.anneals.bulkPut(
+      snapshot.anneals.map((row) => ({
+        ...row,
+        actualHours: typeof row.actualHours === 'number' ? row.actualHours : null,
+        revision: ROW_REVISION,
+      })),
+    )
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })
 }

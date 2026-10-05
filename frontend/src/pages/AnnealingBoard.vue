@@ -2,6 +2,8 @@
 /**
  * /annealing 退火窑位分配与曲线编排
  * 窑位冲突时禁用提交；出炉即回写作品状态为「已退火」。
+ * 支持补记各曲线段实际时长：补记 / 撤销后该段时长、全流程合计与占用窗立即按新口径重算，
+ * 同窑位撞上的记录对实时标在占用表上。
  * 消费模型：Anneal、Piece、Furnace；复用组件：<FilterBar>、<StatBadge>、<StageTag>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -25,6 +27,10 @@ const dialogVisible = ref(false)
 const submitting = ref(false)
 const editingId = ref<string | null>(null)
 const formRef = ref<FormInstance>()
+
+const actualDialogVisible = ref(false)
+const actualTargetId = ref<string | null>(null)
+const actualHoursInput = ref<number>(0)
 
 const form = reactive<AnnealDraft>({
   pieceId: '',
@@ -88,6 +94,22 @@ const stats = computed(() => ({
   firing: annealStore.anneals.filter((row) => row.state === '退火中').length,
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
 }))
+
+/** 补记对话框当前指向的退火记录（随 store 实时更新） */
+const actualTarget = computed<Anneal | null>(() =>
+  actualTargetId.value === null
+    ? null
+    : annealStore.anneals.find((row) => row.id === actualTargetId.value) ?? null,
+)
+
+/** 补记对话框里该段的理论参考时长 */
+const actualTheory = computed(() => {
+  const target = actualTarget.value
+  if (target === null) return { thickness: 0, hours: 0, text: '' }
+  const thickness = annealStore.wallThicknessOf(target.pieceId)
+  const hours = segmentHours(target.curveSeg, thickness)
+  return { thickness, hours, text: formatHours(hours) }
+})
 
 onMounted(() => {
   void annealStore.loadAll()
@@ -175,6 +197,41 @@ async function handleAdvance(row: Anneal): Promise<void> {
   ElMessage.success(annealStore.lastMessage)
 }
 
+function openActual(row: Anneal): void {
+  actualTargetId.value = row.id
+  actualHoursInput.value = row.actualHours ?? segmentHours(row.curveSeg, annealStore.wallThicknessOf(row.pieceId))
+  actualDialogVisible.value = true
+}
+
+async function handleSaveActual(): Promise<void> {
+  if (actualTarget.value === null) return
+  submitting.value = true
+  try {
+    const ok = await annealStore.saveActualHours(actualTarget.value.id, actualHoursInput.value)
+    if (!ok) {
+      ElMessage.error(annealStore.lastMessage)
+      return
+    }
+    ElMessage.success('补记已保存，占用窗已按补记重算')
+    actualDialogVisible.value = false
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function handleClearActual(): Promise<void> {
+  if (actualTarget.value === null) return
+  submitting.value = true
+  try {
+    const ok = await annealStore.clearActualHours(actualTarget.value.id)
+    if (!ok) return
+    ElMessage.success('已撤销补记，恢复按壁厚计算的理论口径')
+    actualDialogVisible.value = false
+  } finally {
+    submitting.value = false
+  }
+}
+
 function handleFilterChange(key: string, value: string): void {
   if (key === 'state') annealStore.setFilters({ state: value as AnnealState | 'all' })
   if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
@@ -198,6 +255,19 @@ function handleFilterChange(key: string, value: string): void {
         :hint="`已占用 ${annealStore.occupiedSlotCount} / ${annealStore.allSlots.length} 个窑位`"
       />
     </div>
+
+    <el-alert
+      v-if="annealStore.conflictPairs.length > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`窑位时段冲突 ${annealStore.conflictPairs.length} 处：以下记录的占用窗重叠，请调整排产`"
+    >
+      <div v-for="pair in annealStore.conflictPairs" :key="`${pair.aId}-${pair.bId}`">
+        窑位 {{ pair.kilnSlot }}：「{{ pair.aName }}」与「{{ pair.bName }}」时段重叠
+      </div>
+    </el-alert>
 
     <el-alert
       v-if="annealStore.lastMessage !== ''"
@@ -254,7 +324,8 @@ function handleFilterChange(key: string, value: string): void {
               </el-link>
               <span class="cell-sub">
                 壁厚 {{ annealStore.wallThicknessOf(row.pieceId) }} mm · 全流程
-                {{ annealStore.durationOf(row.pieceId).text }}
+                {{ annealStore.durationOf(row.pieceId).text
+                }}{{ annealStore.durationOf(row.pieceId).hasActual ? '（含补记）' : '' }}
               </span>
             </div>
           </template>
@@ -275,9 +346,17 @@ function handleFilterChange(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="该段时长" width="120" align="right">
+        <el-table-column label="该段时长" width="140" align="right">
           <template #default="{ row }">
-            {{ formatHours(segmentHours(row.curveSeg, annealStore.wallThicknessOf(row.pieceId))) }}
+            <div class="cell-stack cell-right">
+              <span>
+                {{ formatHours(annealStore.segHoursOf(row)) }}
+                <el-tag v-if="row.actualHours !== null" size="small" type="warning" effect="plain">补记</el-tag>
+              </span>
+              <span v-if="row.actualHours !== null" class="cell-sub">
+                理论 {{ formatHours(segmentHours(row.curveSeg, annealStore.wallThicknessOf(row.pieceId))) }}
+              </span>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="入窑时间" width="160">
@@ -300,10 +379,13 @@ function handleFilterChange(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" :disabled="row.state === '已出炉'" @click="handleAdvance(row)">
               推进状态
+            </el-button>
+            <el-button link type="primary" size="small" @click="openActual(row)">
+              {{ row.actualHours === null ? '补记时长' : '改补记' }}
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
@@ -321,12 +403,31 @@ function handleFilterChange(key: string, value: string): void {
           v-for="slot in annealStore.allSlots"
           :key="slot"
           class="slot-cell"
-          :class="{ 'is-occupied': annealStore.occupancy.some((row) => row.kilnSlot === slot && row.occupied) }"
+          :class="{
+            'is-occupied': annealStore.occupancy.some((row) => row.kilnSlot === slot && row.occupied),
+            'is-conflict': annealStore.occupancy.some((row) => row.kilnSlot === slot && row.conflictWith.length > 0),
+          }"
         >
-          <div class="slot-name">{{ slot }}</div>
+          <div class="slot-name">
+            <span>{{ slot }}</span>
+            <el-tag
+              v-if="annealStore.occupancy.some((row) => row.kilnSlot === slot && row.conflictWith.length > 0)"
+              type="danger"
+              size="small"
+              effect="dark"
+            >
+              冲突
+            </el-tag>
+          </div>
           <template v-for="row in annealStore.occupancy.filter((item) => item.kilnSlot === slot)" :key="row.annealId">
-            <div class="slot-detail">
-              {{ row.pieceName }} · {{ row.curveSeg }} · {{ row.state }}
+            <div class="slot-detail" :class="{ 'is-conflict': row.conflictWith.length > 0 }">
+              <div>{{ row.pieceName }} · {{ row.curveSeg }} · {{ row.state }}</div>
+              <div class="slot-window">
+                {{ row.inAt.slice(5).replace('T', ' ') }} → {{ row.outAt === '' ? '预计 ' : '' }}{{ row.windowEnd }}
+              </div>
+              <div v-if="row.conflictWith.length > 0" class="slot-conflict">
+                ⚠ 与「{{ row.conflictWith.join('」「') }}」时段重叠
+              </div>
             </div>
           </template>
           <div v-if="annealStore.occupancy.filter((item) => item.kilnSlot === slot).length === 0" class="slot-detail is-free">
@@ -421,6 +522,47 @@ function handleFilterChange(key: string, value: string): void {
         </el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="actualDialogVisible" title="补记曲线段实际时长" width="520px">
+      <template v-if="actualTarget !== null">
+        <el-descriptions :column="1" border size="small" class="mb-14">
+          <el-descriptions-item label="作品">
+            {{ pieceName[actualTarget.pieceId] ?? '（作品已删除）' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="窑位 / 曲线段">
+            {{ actualTarget.kilnSlot }} · {{ actualTarget.curveSeg }}
+          </el-descriptions-item>
+          <el-descriptions-item label="理论时长">
+            按壁厚 {{ actualTheory.thickness }} mm 计算：{{ actualTheory.text }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <el-form label-width="120px">
+          <el-form-item label="实际时长">
+            <el-input-number v-model="actualHoursInput" :min="0.5" :max="999" :precision="1" :step="0.5" />
+            <span class="unit-suffix">小时</span>
+          </el-form-item>
+        </el-form>
+        <el-alert
+          type="info"
+          show-icon
+          :closable="false"
+          title="保存后该段时长、全流程合计与占用表上的占用窗都按补记计算，同窑位后续记录立即重判冲突；撤销补记即回到理论口径。"
+        />
+      </template>
+      <template #footer>
+        <el-button
+          v-if="actualTarget !== null && actualTarget.actualHours !== null"
+          type="danger"
+          plain
+          :loading="submitting"
+          @click="handleClearActual"
+        >
+          撤销补记
+        </el-button>
+        <el-button @click="actualDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="submitting" @click="handleSaveActual">保存补记</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -452,9 +594,18 @@ function handleFilterChange(key: string, value: string): void {
   gap: 2px;
 }
 
+.cell-right {
+  align-items: flex-end;
+}
+
 .cell-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.unit-suffix {
+  margin-left: 8px;
+  color: #5b6b7a;
 }
 
 .slot-grid {
@@ -475,7 +626,16 @@ function handleFilterChange(key: string, value: string): void {
   background: #fff8f1;
 }
 
+.slot-cell.is-conflict {
+  border-color: #f56c6c;
+  background: #fef0f0;
+}
+
 .slot-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 13px;
   font-weight: 600;
   color: #1d2b3a;
@@ -486,6 +646,23 @@ function handleFilterChange(key: string, value: string): void {
   font-size: 12px;
   line-height: 1.6;
   color: #5b6b7a;
+}
+
+.slot-detail.is-conflict {
+  color: #c45656;
+}
+
+.slot-window {
+  color: #8b95a1;
+}
+
+.slot-detail.is-conflict .slot-window {
+  color: #c45656;
+}
+
+.slot-conflict {
+  font-weight: 600;
+  color: #f56c6c;
 }
 
 .slot-detail.is-free {

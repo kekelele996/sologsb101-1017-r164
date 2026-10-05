@@ -11,7 +11,7 @@ import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
-import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
+import { formatHours, isLowRemain, segmentHours, effectiveTotalHours, totalAnnealHours } from './thermal'
 
 /** 触发浏览器下载 */
 export function download(filename: string, content: string, mime: string): void {
@@ -101,6 +101,7 @@ export function buildScheduleCsv(
     '退火窑位',
     '退火状态',
     '理论退火时长',
+    '退火时长(含补记)',
     '检验次数',
     '最近检验结果',
   ]
@@ -130,6 +131,7 @@ export function buildScheduleCsv(
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
+        formatHours(effectiveTotalHours(pieceAnneals, piece.wallThicknessMm)),
         pieceInspects.length,
         latestInspect?.result ?? '—',
       ]
@@ -200,7 +202,8 @@ export function buildStepCardText(
   if (anneals.length > 0) {
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      const actual = row.actualHours === null ? '' : ` · 补记实际 ${formatHours(row.actualHours)}`
+      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}${actual}`)
     })
   }
   return lines.join('\n')

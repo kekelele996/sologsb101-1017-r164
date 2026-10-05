@@ -1,11 +1,12 @@
 /**
  * 热工计算工具
- * - 退火曲线段时长换算（升温 / 保温 / 缓冷）
- * - 窑位占用判重（同一窑位时间窗重叠检测）
+ * - 退火曲线段时长换算（升温 / 保温 / 缓冷），支持按补记的实际时长取值
+ * - 窑位占用判重（同一窑位时间窗重叠检测）与冲突对枚举
  * - 温度单位换算（℃ ↔ ℉）
  * - 工艺温度区间与设计尺寸校验
  */
 import type { Anneal, CurveSeg } from '../types/anneal'
+import { CURVE_SEG_OPTIONS } from '../types/anneal'
 import type { Craft } from '../types/piece'
 
 /** 保留 1 位小数 */
@@ -90,6 +91,37 @@ export function totalAnnealHours(wallThicknessMm: number): number {
   )
 }
 
+/** 该记录曲线段的有效时长：已补记实际时长按补记算，否则按壁厚理论值 */
+export function effectiveSegHours(
+  row: Pick<Anneal, 'curveSeg' | 'actualHours'>,
+  wallThicknessMm: number,
+): number {
+  if (typeof row.actualHours === 'number' && row.actualHours > 0) return round1(row.actualHours)
+  return segmentHours(row.curveSeg, wallThicknessMm)
+}
+
+/**
+ * 一件作品全流程退火时长（小时）：逐段取有效时长再合计。
+ * 同一曲线段有多条记录时，以入窑时间最新的一条补记为准；没有补记的段仍按壁厚理论值。
+ */
+export function effectiveTotalHours(
+  rows: Array<Pick<Anneal, 'curveSeg' | 'actualHours' | 'inAt'>>,
+  wallThicknessMm: number,
+): number {
+  const actualBySeg = new Map<CurveSeg, number>()
+  const sorted = [...rows].sort((a, b) => a.inAt.localeCompare(b.inAt))
+  sorted.forEach((row) => {
+    if (typeof row.actualHours === 'number' && row.actualHours > 0) {
+      actualBySeg.set(row.curveSeg, row.actualHours)
+    }
+  })
+  const total = CURVE_SEG_OPTIONS.reduce(
+    (acc, seg) => acc + (actualBySeg.get(seg) ?? segmentHours(seg, wallThicknessMm)),
+    0,
+  )
+  return round1(total)
+}
+
 /** 把小时数格式化为「x 小时 y 分钟」 */
 export function formatHours(hours: number): string {
   const total = Math.max(0, Math.round(hours * 60))
@@ -107,13 +139,16 @@ export function parseAt(value: string): number {
   return Number.isNaN(stamp) ? Number.NaN : stamp
 }
 
-/** 时间窗：[入窑, 出炉]；未出炉时以入窑 + 预计时长作为临时出炉时间 */
-export function annealWindow(row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg'>, wallThicknessMm: number): [number, number] {
+/** 时间窗：[入窑, 出炉]；未出炉时以入窑 + 有效时长（补记优先，否则理论值）作为临时出炉时间 */
+export function annealWindow(
+  row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg' | 'actualHours'>,
+  wallThicknessMm: number,
+): [number, number] {
   const start = parseAt(row.inAt)
   if (Number.isNaN(start)) return [Number.NaN, Number.NaN]
   const end = parseAt(row.outAt)
   if (!Number.isNaN(end) && end > start) return [start, end]
-  return [start, start + segmentHours(row.curveSeg, wallThicknessMm) * 3600 * 1000]
+  return [start, start + effectiveSegHours(row, wallThicknessMm) * 3600 * 1000]
 }
 
 /** 两个时间窗是否重叠 */
@@ -136,7 +171,7 @@ export interface SlotConflict {
  */
 export function checkSlotConflict(
   existing: Anneal[],
-  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId' | 'actualHours'>,
   wallThicknessOf: (pieceId: string) => number,
   excludeAnnealId = '',
 ): SlotConflict {
@@ -157,6 +192,48 @@ export function checkSlotConflict(
     }
   }
   return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
+}
+
+/** 同一窑位上时间窗重叠的一对退火记录 */
+export interface SlotConflictPair {
+  kilnSlot: string
+  aId: string
+  bId: string
+}
+
+/**
+ * 枚举当前全部窑位冲突对：同一窑位两两记录时间窗重叠即算一对。
+ * 补记实际时长会改变占用窗，保存 / 撤销补记后据此立即重判，无需等下次编辑。
+ */
+export function findSlotConflictPairs(
+  existing: Anneal[],
+  wallThicknessOf: (pieceId: string) => number,
+): SlotConflictPair[] {
+  const pairs: SlotConflictPair[] = []
+  const sorted = [...existing].sort(
+    (a, b) => a.kilnSlot.localeCompare(b.kilnSlot) || a.inAt.localeCompare(b.inAt),
+  )
+  for (let i = 0; i < sorted.length; i += 1) {
+    for (let j = i + 1; j < sorted.length; j += 1) {
+      const a = sorted[i]
+      const b = sorted[j]
+      if (a.kilnSlot !== b.kilnSlot) continue
+      const aWindow = annealWindow(a, wallThicknessOf(a.pieceId))
+      const bWindow = annealWindow(b, wallThicknessOf(b.pieceId))
+      if (windowsOverlap(aWindow, bWindow)) {
+        pairs.push({ kilnSlot: a.kilnSlot, aId: a.id, bId: b.id })
+      }
+    }
+  }
+  return pairs
+}
+
+/** 把时间戳格式化为「MM-DD HH:mm」，用于占用表的时间窗展示 */
+export function formatClock(stamp: number): string {
+  if (Number.isNaN(stamp)) return '—'
+  const date = new Date(stamp)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
 /** 生成某台退火窑的窑位列表 */

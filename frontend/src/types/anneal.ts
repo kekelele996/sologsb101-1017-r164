@@ -29,6 +29,8 @@ export interface Anneal {
   outAt: string
   /** 退火状态 */
   state: AnnealState
+  /** 补记的该曲线段实际时长（小时）；null 表示未补记，按壁厚理论值计算 */
+  actualHours: number | null
   createdAt: string
   updatedAt: string
   revision: number

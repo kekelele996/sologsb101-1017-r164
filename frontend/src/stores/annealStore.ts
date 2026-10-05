@@ -1,6 +1,8 @@
 /**
  * 退火窑位与曲线状态管理（Pinia）
  * 维护窑位占用表与退火曲线段；窑位冲突时禁止提交，出炉即回写作品状态。
+ * 支持补记各曲线段实际时长：补记后该段时长、全流程合计与占用窗按补记算，
+ * 同窑位冲突立即重判并在占用表标出相撞的记录对；撤销补记回到理论口径。
  */
 import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
@@ -15,13 +17,19 @@ import {
   initDatabase,
   putAnneal,
   removeAnneal,
+  setAnnealActualHours,
 } from '../utils/db'
 import {
+  annealWindow,
   checkSlotConflict,
+  effectiveSegHours,
+  effectiveTotalHours,
+  findSlotConflictPairs,
+  formatClock,
   formatHours,
   kilnSlots,
+  round1,
   segmentHours,
-  totalAnnealHours,
   type SlotConflict,
 } from '../utils/thermal'
 import { nowIso, nowLocalInput, uuid } from '../utils/id'
@@ -46,6 +54,19 @@ export interface SlotOccupancy {
   state: AnnealState
   /** 该窑位当前是否被未出炉记录占用 */
   occupied: boolean
+  /** 占用窗结束时间：已出炉取实际出炉时间，未出炉按有效时长（补记优先）预计 */
+  windowEnd: string
+  /** 与该记录时间窗重叠的对方作品名（占用表据此标出哪两条撞上） */
+  conflictWith: string[]
+}
+
+/** 一对撞在同一窑位时间窗上的退火记录 */
+export interface SlotConflictInfo {
+  kilnSlot: string
+  aId: string
+  bId: string
+  aName: string
+  bName: string
 }
 
 const EMPTY_FILTERS: AnnealFilters = { keyword: '', state: 'all', curveSeg: 'all', kilnCode: 'all' }
@@ -74,6 +95,38 @@ export const useAnnealStore = defineStore('anneal', () => {
   const wallThicknessOf = (pieceId: string): number =>
     pieces.value.find((row) => row.id === pieceId)?.wallThicknessMm ?? 4
 
+  const pieceNameOf = (pieceId: string): string =>
+    pieces.value.find((row) => row.id === pieceId)?.name ?? '（作品已删除）'
+
+  /**
+   * 当前全部窑位冲突对。
+   * 冲突是从记录数据派生的纯计算：补记 / 撤销补记一落库，这里立即重判，
+   * 同窑位后续记录是否被撞上马上可见，不必等到下次编辑那条记录。
+   */
+  const conflictPairs = computed<SlotConflictInfo[]>(() =>
+    findSlotConflictPairs(anneals.value, wallThicknessOf).map((pair) => {
+      const a = anneals.value.find((row) => row.id === pair.aId)
+      const b = anneals.value.find((row) => row.id === pair.bId)
+      return {
+        kilnSlot: pair.kilnSlot,
+        aId: pair.aId,
+        bId: pair.bId,
+        aName: pieceNameOf(a?.pieceId ?? ''),
+        bName: pieceNameOf(b?.pieceId ?? ''),
+      }
+    }),
+  )
+
+  /** 每条退火记录撞上了哪些作品（annealId → 对方作品名列表） */
+  const conflictNamesByAnneal = computed<Map<string, string[]>>(() => {
+    const map = new Map<string, string[]>()
+    conflictPairs.value.forEach((pair) => {
+      map.set(pair.aId, [...(map.get(pair.aId) ?? []), pair.bName])
+      map.set(pair.bId, [...(map.get(pair.bId) ?? []), pair.aName])
+    })
+    return map
+  })
+
   /** 全部窑位（按已有退火记录推导窑号，兜底 AN-01） */
   const allSlots = computed<string[]>(() => {
     const codes = kilnCodes.value.length > 0 ? kilnCodes.value : ['AN-01']
@@ -84,17 +137,19 @@ export const useAnnealStore = defineStore('anneal', () => {
   const occupancy = computed<SlotOccupancy[]>(() =>
     anneals.value
       .map((row) => {
-        const piece = pieces.value.find((item) => item.id === row.pieceId)
+        const window = annealWindow(row, wallThicknessOf(row.pieceId))
         return {
           kilnSlot: row.kilnSlot,
           annealId: row.id,
           pieceId: row.pieceId,
-          pieceName: piece?.name ?? '（作品已删除）',
+          pieceName: pieceNameOf(row.pieceId),
           curveSeg: row.curveSeg,
           inAt: row.inAt,
           outAt: row.outAt,
           state: row.state,
           occupied: row.state !== '已出炉',
+          windowEnd: formatClock(window[1]),
+          conflictWith: conflictNamesByAnneal.value.get(row.id) ?? [],
         }
       })
       .sort((a, b) => a.kilnSlot.localeCompare(b.kilnSlot) || a.inAt.localeCompare(b.inAt))
@@ -122,18 +177,30 @@ export const useAnnealStore = defineStore('anneal', () => {
     })
   })
 
-  /** 某件作品的窑位冲突检测（编辑时排除自身） */
+  /** 某件作品的窑位冲突检测（编辑时排除自身，并带上该记录已保存的补记时长） */
   function conflictOf(
     candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
   ): SlotConflict {
-    return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id)
+    const existing = anneals.value.find((row) => row.id === candidate.id)
+    return checkSlotConflict(
+      anneals.value,
+      { ...candidate, actualHours: existing?.actualHours ?? null },
+      wallThicknessOf,
+      candidate.id,
+    )
   }
 
-  /** 某件作品的退火时长汇总 */
-  function durationOf(pieceId: string): { hours: number; text: string } {
-    const thickness = wallThicknessOf(pieceId)
-    const hours = totalAnnealHours(thickness)
-    return { hours, text: formatHours(hours) }
+  /** 该记录曲线段的有效时长：补记优先，未补记按壁厚理论值 */
+  function segHoursOf(row: Pick<Anneal, 'curveSeg' | 'actualHours' | 'pieceId'>): number {
+    return effectiveSegHours(row, wallThicknessOf(row.pieceId))
+  }
+
+  /** 某件作品的退火时长汇总：已补记的段按补记算，未补记的段按壁厚理论值 */
+  function durationOf(pieceId: string): { hours: number; text: string; hasActual: boolean } {
+    const rows = anneals.value.filter((row) => row.pieceId === pieceId)
+    const hours = effectiveTotalHours(rows, wallThicknessOf(pieceId))
+    const hasActual = rows.some((row) => typeof row.actualHours === 'number' && row.actualHours > 0)
+    return { hours, text: formatHours(hours), hasActual }
   }
 
   async function loadAll(): Promise<void> {
@@ -196,6 +263,7 @@ export const useAnnealStore = defineStore('anneal', () => {
       inAt: draft.inAt,
       outAt: draft.outAt,
       state: draft.state,
+      actualHours: null,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -241,6 +309,50 @@ export const useAnnealStore = defineStore('anneal', () => {
     lastMessage.value = '退火记录已删除'
   }
 
+  /** 在给定记录集合上检查某条记录是否撞上同窑位的其他记录，返回提醒文案；否则返回空串 */
+  function conflictNoticeOf(rows: Anneal[], annealId: string): string {
+    const hits = findSlotConflictPairs(rows, wallThicknessOf).filter(
+      (pair) => pair.aId === annealId || pair.bId === annealId,
+    )
+    if (hits.length === 0) return ''
+    const nameOf = (id: string): string => pieceNameOf(rows.find((row) => row.id === id)?.pieceId ?? '')
+    const others = hits.map((pair) => (pair.aId === annealId ? nameOf(pair.bId) : nameOf(pair.aId)))
+    return `注意：占用窗变化后与「${others.join('」「')}」在窑位 ${hits[0].kilnSlot} 时段重叠，请调整排产。`
+  }
+
+  /** 补记（或修改）某条记录的曲线段实际时长；保存后立即按新占用窗重判同窑位冲突 */
+  async function saveActualHours(annealId: string, hours: number): Promise<boolean> {
+    const existing = anneals.value.find((row) => row.id === annealId)
+    if (existing === undefined) return false
+    const value = round1(hours)
+    if (!Number.isFinite(value) || value <= 0) {
+      lastMessage.value = '补记时长必须大于 0 小时'
+      return false
+    }
+    await setAnnealActualHours(annealId, value)
+    revision.value += 1
+    // 在本地套用补记后的记录集合上重判，不依赖 liveQuery 回读时序
+    const nextRows = anneals.value.map((row) => (row.id === annealId ? { ...row, actualHours: value } : row))
+    const notice = conflictNoticeOf(nextRows, annealId)
+    lastMessage.value = `已补记「${existing.curveSeg}」段实际时长 ${formatHours(value)}，该段时长、全流程合计与占用窗均按补记计算。${notice}`
+    return true
+  }
+
+  /** 撤销补记：该段时长、全流程合计与占用窗回到按壁厚计算的理论口径，并立即重判冲突 */
+  async function clearActualHours(annealId: string): Promise<boolean> {
+    const existing = anneals.value.find((row) => row.id === annealId)
+    if (existing === undefined) return false
+    if (existing.actualHours === null) return false
+    await setAnnealActualHours(annealId, null)
+    revision.value += 1
+    const nextRows = anneals.value.map((row) => (row.id === annealId ? { ...row, actualHours: null } : row))
+    const notice = conflictNoticeOf(nextRows, annealId)
+    lastMessage.value = `已撤销「${existing.curveSeg}」段补记，恢复按壁厚 ${wallThicknessOf(existing.pieceId)} mm 的理论时长 ${formatHours(
+      segmentHours(existing.curveSeg, wallThicknessOf(existing.pieceId)),
+    )} 计算。${notice}`
+    return true
+  }
+
   /** 推进退火状态；「已出炉」写回出炉时间并同步作品状态 */
   async function advance(annealId: string): Promise<AnnealState | null> {
     const existing = anneals.value.find((row) => row.id === annealId)
@@ -267,11 +379,13 @@ export const useAnnealStore = defineStore('anneal', () => {
     kilnCodes,
     allSlots,
     occupancy,
+    conflictPairs,
     occupiedSlotCount,
     occupancyRate,
     visibleAnneals,
     wallThicknessOf,
     conflictOf,
+    segHoursOf,
     durationOf,
     loadAll,
     setFilters,
@@ -279,6 +393,8 @@ export const useAnnealStore = defineStore('anneal', () => {
     createAnneal,
     updateAnneal,
     deleteAnneal,
+    saveActualHours,
+    clearActualHours,
     advance,
   }
 })
